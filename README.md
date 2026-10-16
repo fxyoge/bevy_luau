@@ -1,15 +1,20 @@
 # bevy_luau
 
-Portable, compile-once Luau expressions shared by `bevy_state_tree` and
-`bevy_kui`. No Bevy dependency; compiled expressions and portable values contain
-no VM handles and can move between worker threads.
+Portable, compile-once Luau expressions with consumer-defined environments.
+No Bevy dependency; compiled expressions, environment specifications, and portable
+values contain no VM handles and can move between worker threads.
 
 ```rust
 use std::collections::BTreeMap;
-use bevy_luau::{compile_readonly, LuauValue};
+use bevy_luau::{EnvironmentSpec, LuauValue};
 
-let expression = compile_readonly(
-    "if installed then {x=0, y=0, z=3} else {x=-28, y=205, z=8}"
+let environment = EnvironmentSpec::builder()
+    .globals(["type", "tostring"])
+    .library("math", &["random", "randomseed"])
+    .read_only(true)
+    .build()?;
+let expression = environment.compile(
+    "if installed then {x=0, y=0, z=3} else {x=-28, y=205, z=8}", false
 )?;
 let value = expression.evaluate(&BTreeMap::from([
     ("installed".into(), LuauValue::Boolean(true)),
@@ -30,23 +35,37 @@ that might address builtins are evaluated by the VM.
 Expressions expose conservative root `dependencies`, including computed keys
 and reads inside functions. Lexical locals, function parameters, loop bindings,
 and repeat-until scopes are excluded. The bounded shared
-`cached_readonly` cache avoids recompiling authored expressions across mounts.
+`EnvironmentSpec::cached_expression` cache avoids recompiling expressions across
+users of the same specification. Its key includes specification identity and
+boolean-result mode; distinct namespaces never share compiled cache entries.
 
-## Evaluation policies
+## Environment ownership and sharing
 
-`compile_readonly` creates presentation expressions. Input records/sequences and
-the evaluation environment are deeply read-only. Only pure standard libraries
-and basic functions are exposed; random functions, environment access, module
-loading, and application effects are unavailable. Expressions may construct
-and mutate local scratch tables and call immediately invoked local functions.
-No state survives an evaluation. Only portable results are returned.
+Consumers define and retain an immutable `EnvironmentSpec`, selecting exposed VM
+globals and library exports. There is no implicit fallback to all VM globals and
+no process-wide registration order. Cloning a specification retains its identity;
+building another creates an independent namespace. Consumer libraries should own
+their defaults so applications need no registration or setup calls.
 
-`compile_expression` / `evaluate` provide the datamodel policy, including
-evaluation-local mutation used to implement ordered nested assignments. A
-generic optional contextual binding can be supplied without copying all input
-values. The state tree owns persistence, event bindings/projection, assignment
-policy, and authored source locations; none are built into this engine. Both policies share VM workers,
-bytecode/function caching, execution limits, and native plans.
+Root input names matching exposed builtins are rejected, even when their value is
+nil, before both native and VM evaluation. `validate_input_name` supports early
+authoring diagnostics. Nested fields such as `printer.type` and lexical locals
+remain unrestricted. The engine does not reserve names absent from a specification.
+
+`read_only(true)` deeply freezes input records/sequences and rejects global
+assignments; local scratch tables may still be mutated. The default mutable mode
+supports evaluation-local assignments. Environments are cleared before each call;
+persistence and contextual bindings belong to consumers. `evaluate` accepts an
+optional contextual input, which may replace an ordinary input of the same name
+but cannot replace a builtin.
+
+Within each worker VM, a specification's library copies, builtin namespace, and
+protected fallback metatable are constructed once and shared by its cached
+functions. Each function retains its own input table. These shared objects are
+independent of the 256-entry function cache, so eviction does not recopy libraries.
+Independent VMs never share Lua objects. `prepare_current_thread` optionally
+materializes a namespace without executing expressions; normal evaluation does
+this automatically. Preparing one thread does not prepare other workers.
 
 VM workers are thread-local. Each uses a 64 MiB memory limit, interrupt budget,
 and a bounded function cache. Portable results are limited to 64 nesting levels

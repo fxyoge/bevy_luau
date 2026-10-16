@@ -1,5 +1,28 @@
-use bevy_luau::{LuauValue as V, compile_readonly};
+use bevy_luau::{CompiledLuauExpression, EnvironmentSpec, Error, LuauValue as V};
 use std::collections::BTreeMap;
+
+fn environment() -> &'static EnvironmentSpec {
+    static SPEC: std::sync::OnceLock<EnvironmentSpec> = std::sync::OnceLock::new();
+    SPEC.get_or_init(|| {
+        EnvironmentSpec::builder()
+            .globals([
+                "assert", "error", "ipairs", "pairs", "next", "select", "tonumber", "tostring",
+                "type", "typeof",
+            ])
+            .library("math", &["random", "randomseed"])
+            .library("string", &[])
+            .library("table", &[])
+            .library("utf8", &[])
+            .library("bit32", &[])
+            .library("buffer", &[])
+            .read_only(true)
+            .build()
+            .unwrap()
+    })
+}
+fn compile_readonly(source: &str) -> Result<CompiledLuauExpression, Error> {
+    environment().compile(source, false)
+}
 
 fn inputs() -> BTreeMap<String, V> {
     BTreeMap::from([
@@ -72,7 +95,7 @@ fn vm_fallback_supports_records_helpers_and_pure_functions() {
 }
 
 #[test]
-fn presentation_inputs_and_globals_are_deeply_immutable() {
+fn readonly_inputs_and_globals_are_deeply_immutable() {
     for source in [
         "(function() labels.oak = 'Changed' return true end)()",
         "(function() table.insert(items, 5) return true end)()",
@@ -100,18 +123,24 @@ fn presentation_inputs_and_globals_are_deeply_immutable() {
 }
 
 #[test]
-fn scopes_and_nil_shadow_builtins_even_with_cached_functions() {
+fn builtin_collisions_fail_before_both_native_and_vm_execution() {
     let expression = compile_readonly("type(math)").unwrap();
     assert_eq!(
         expression.evaluate(&BTreeMap::new()).unwrap(),
         V::String("table".into())
     );
-    assert_eq!(
-        expression
-            .evaluate(&BTreeMap::from([("math".into(), V::Nil)]))
-            .unwrap(),
-        V::String("nil".into())
-    );
+    for value in [V::Nil, V::Integer(42)] {
+        let inputs = BTreeMap::from([("math".into(), value)]);
+        assert!(
+            expression
+                .evaluate(&inputs)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved")
+        );
+        assert!(expression.evaluate_vm(&inputs).is_err());
+        assert!(compile_readonly("42").unwrap().evaluate(&inputs).is_err());
+    }
     assert_eq!(
         expression.evaluate(&BTreeMap::new()).unwrap(),
         V::String("table".into())

@@ -1,10 +1,11 @@
-use bevy_luau::{LuauValue as V, compile_readonly};
+use bevy_luau::{EnvironmentSpec, LuauValue as V};
 use std::{collections::BTreeMap, hint::black_box, time::Instant};
 
 fn main() {
     let inputs = BTreeMap::from([("open".into(), V::Boolean(true))]);
+    let environment = EnvironmentSpec::builder().read_only(true).build().unwrap();
     for source in ["open", "not open", "if open then 3 else 8"] {
-        let expression = compile_readonly(source).unwrap();
+        let expression = environment.compile(source, false).unwrap();
         expression.evaluate_vm(&inputs).unwrap();
         for vm in [false, true] {
             let start = Instant::now();

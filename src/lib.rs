@@ -1,32 +1,10 @@
 //! Compile-once portable Luau expressions, with equivalent native read plans.
 //! This crate has no Bevy dependency and retains no VM handles in compiled assets.
+mod environment;
 mod native;
 
+pub use environment::{EnvironmentBuilder, EnvironmentSpec};
 pub use mlua::Error;
-
-/// Root names supplied by the pure presentation environment when not shadowed
-/// by an explicit input binding.
-pub fn is_presentation_builtin(name: &str) -> bool {
-    matches!(
-        name,
-        "assert"
-            | "error"
-            | "ipairs"
-            | "pairs"
-            | "next"
-            | "select"
-            | "tonumber"
-            | "tostring"
-            | "type"
-            | "typeof"
-            | "math"
-            | "string"
-            | "table"
-            | "utf8"
-            | "bit32"
-            | "buffer"
-    )
-}
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, HashMap, HashSet},
@@ -66,7 +44,7 @@ pub struct CompiledLuauExpression {
     /// Conservative root dependencies; includes names used in nested expressions.
     pub dependencies: Vec<String>,
     native: Option<native::Plan>,
-    readonly: bool,
+    environment: EnvironmentSpec,
 }
 
 impl CompiledLuauExpression {
@@ -74,7 +52,7 @@ impl CompiledLuauExpression {
         self.native.is_some()
     }
 
-    /// Read-only expressions use an immutable input snapshot and pure builtins.
+    /// Evaluate with this expression's configured namespace and input policy.
     pub fn evaluate(&self, inputs: &BTreeMap<String, LuauValue>) -> Result<LuauValue, Error> {
         let names: Vec<Box<str>> = inputs.keys().map(|name| name.as_str().into()).collect();
         let values: Vec<_> = inputs.values().cloned().collect();
@@ -85,54 +63,60 @@ impl CompiledLuauExpression {
     pub fn evaluate_vm(&self, inputs: &BTreeMap<String, LuauValue>) -> Result<LuauValue, Error> {
         let names: Vec<Box<str>> = inputs.keys().map(|name| name.as_str().into()).collect();
         let values: Vec<_> = inputs.values().cloned().collect();
+        validate_inputs(self, &names, &values, None)?;
         WORKER.with_borrow_mut(|worker| worker.evaluate(self, &names, &values, None))
     }
 }
 
-/// Compile a presentation expression. Inputs are deeply immutable; only pure
-/// standard functions are exposed. No owner state or VM state can be retained.
-pub fn compile_readonly(source: &str) -> Result<CompiledLuauExpression, Error> {
-    let mut expression = compile_expression(source, false)?;
-    expression.readonly = true;
-    Ok(expression)
-}
-
-/// Bounded, shared compilation cache for authored expression strings. Compiled
-/// expressions are VM-independent and can be evaluated on any worker thread.
-pub fn cached_readonly(source: &str) -> Result<Arc<CompiledLuauExpression>, Error> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Arc<CompiledLuauExpression>>>> = OnceLock::new();
-    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
-    if let Some(expression) = cache.get(source) {
-        return Ok(expression.clone());
+impl EnvironmentSpec {
+    /// Bounded shared compilation cache, isolated by environment identity and boolean mode.
+    pub fn cached_expression(
+        &self,
+        source: &str,
+        boolean: bool,
+    ) -> Result<Arc<CompiledLuauExpression>, Error> {
+        type Key = (u64, String, bool);
+        static CACHE: OnceLock<Mutex<HashMap<Key, Arc<CompiledLuauExpression>>>> = OnceLock::new();
+        let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+        let key = (self.identity(), source.to_owned(), boolean);
+        if let Some(expression) = cache.get(&key) {
+            return Ok(expression.clone());
+        }
+        let expression = Arc::new(self.compile(source, boolean)?);
+        if cache.len() >= 1024 {
+            cache.clear();
+        }
+        cache.insert(key, expression.clone());
+        Ok(expression)
     }
-    let expression = Arc::new(compile_readonly(source)?);
-    if cache.len() >= 1024 {
-        cache.clear();
-    }
-    cache.insert(source.into(), expression.clone());
-    Ok(expression)
-}
 
-pub fn compile_expression(
-    expression: &str,
-    boolean: bool,
-) -> Result<CompiledLuauExpression, Error> {
-    let source = if boolean {
-        format!("return not not ({expression})")
-    } else {
-        format!("return ({expression})")
-    };
-    let bytecode = Compiler::new().compile(&source)?;
-    let ast = full_moon::parse(&source).map_err(|e| Error::runtime(format!("{e:?}")))?;
-    let mut dependencies = native::Dependencies::default();
-    dependencies.visit_ast(&ast);
-    Ok(CompiledLuauExpression {
-        identity: NEXT_EXPRESSION_ID.fetch_add(1, Ordering::Relaxed),
-        bytecode: bytecode.into_boxed_slice(),
-        dependencies: dependencies.roots.into_iter().collect(),
-        native: native::compile(&ast),
-        readonly: false,
-    })
+    /// Compile bytecode and an optional native plan, retaining this namespace.
+    pub fn compile(
+        &self,
+        expression: &str,
+        boolean: bool,
+    ) -> Result<CompiledLuauExpression, Error> {
+        let source = if boolean {
+            format!("return not not ({expression})")
+        } else {
+            format!("return ({expression})")
+        };
+        let bytecode = Compiler::new().compile(&source)?;
+        let ast = full_moon::parse(&source).map_err(|e| Error::runtime(format!("{e:?}")))?;
+        let mut dependencies = native::Dependencies::default();
+        dependencies.visit_ast(&ast);
+        Ok(CompiledLuauExpression {
+            identity: NEXT_EXPRESSION_ID.fetch_add(1, Ordering::Relaxed),
+            bytecode: bytecode.into_boxed_slice(),
+            dependencies: dependencies.roots.into_iter().collect(),
+            native: native::compile(&ast),
+            environment: self.clone(),
+        })
+    }
+    /// Prepare this specification on the calling thread without executing expressions.
+    pub fn prepare_current_thread(&self) -> Result<(), Error> {
+        WORKER.with_borrow_mut(|worker| worker.prepare(self).map(|_| ()))
+    }
 }
 
 thread_local! {
@@ -147,14 +131,9 @@ pub fn evaluate(
     values: &[LuauValue],
     extra: Option<(&str, &LuauValue)>,
 ) -> Result<LuauValue, Error> {
-    if names.len() != values.len() {
-        return Err(Error::runtime(
-            "expression input names and values must have equal lengths",
-        ));
-    }
+    validate_inputs(expression, names, values, extra)?;
     if let Some(plan) = &expression.native {
-        // Native plans only resolve declared roots. Undeclared roots may refer
-        // to sandbox globals, so those expressions stay on the VM.
+        // Undeclared roots may address builtins and must use the VM.
         if plan.roots_declared(names, extra.map(|(name, _)| name)) {
             let value = plan.evaluate(names, values, extra)?;
             return native::normalize(value);
@@ -163,10 +142,31 @@ pub fn evaluate(
     WORKER.with_borrow_mut(|worker| worker.evaluate(expression, names, values, extra))
 }
 
+fn validate_inputs(
+    expression: &CompiledLuauExpression,
+    names: &[Box<str>],
+    values: &[LuauValue],
+    extra: Option<(&str, &LuauValue)>,
+) -> Result<(), Error> {
+    if names.len() != values.len() {
+        return Err(Error::runtime(
+            "expression input names and values must have equal lengths",
+        ));
+    }
+    for name in names {
+        expression.environment.validate_input_name(name)?;
+    }
+    if let Some((name, _)) = extra {
+        expression.environment.validate_input_name(name)?;
+    }
+    Ok(())
+}
+
 struct LuauWorker {
     lua: Lua,
     interrupts: Rc<Cell<usize>>,
     functions: HashMap<u64, CachedFunction>,
+    environments: HashMap<u64, Table>,
     cache_access: u64,
 }
 
@@ -174,7 +174,6 @@ struct CachedFunction {
     function: Function,
     environment: Table,
     last_access: u64,
-    names: Vec<Box<str>>,
 }
 
 impl LuauWorker {
@@ -198,6 +197,7 @@ impl LuauWorker {
             lua,
             interrupts,
             functions: HashMap::new(),
+            environments: HashMap::new(),
             cache_access: 0,
         }
     }
@@ -210,30 +210,19 @@ impl LuauWorker {
         extra: Option<(&str, &LuauValue)>,
     ) -> Result<LuauValue, Error> {
         self.interrupts.set(0);
-        let contextual_names;
-        let cache_names = if let Some((name, _)) = extra {
-            contextual_names = names
-                .iter()
-                .cloned()
-                .chain(std::iter::once(name.into()))
-                .collect::<Vec<_>>();
-            &contextual_names
-        } else {
-            names
-        };
-        let (function, environment) = self.function(expression, cache_names)?;
+        let (function, environment) = self.function(expression)?;
         environment.set_readonly(false);
         environment.clear()?;
 
         for (name, value) in names.iter().zip(values) {
-            if !expression.readonly
+            if !expression.environment.read_only()
                 || expression
                     .dependencies
                     .iter()
                     .any(|root| root == name.as_ref())
             {
                 let value = to_lua(&self.lua, value)?;
-                if expression.readonly {
+                if expression.environment.read_only() {
                     freeze(&value)?;
                 }
                 environment.raw_set(name.as_ref(), value)?;
@@ -241,7 +230,7 @@ impl LuauWorker {
         }
         if let Some((name, value)) = extra {
             let value = to_lua(&self.lua, value)?;
-            if expression.readonly {
+            if expression.environment.read_only() {
                 freeze(&value)?;
             } else if let Value::Table(table) = &value {
                 table.set_readonly(true);
@@ -249,7 +238,7 @@ impl LuauWorker {
             environment.raw_set(name, value)?;
         }
 
-        if expression.readonly {
+        if expression.environment.read_only() {
             environment.set_readonly(true);
         }
         let value = function.call(())?;
@@ -259,14 +248,11 @@ impl LuauWorker {
     fn function(
         &mut self,
         expression: &CompiledLuauExpression,
-        names: &[Box<str>],
     ) -> Result<(Function, Table), Error> {
         self.cache_access = self.cache_access.wrapping_add(1);
         if let Some(cached) = self.functions.get_mut(&expression.identity) {
             cached.last_access = self.cache_access;
-            if cached.names == names {
-                return Ok((cached.function.clone(), cached.environment.clone()));
-            }
+            return Ok((cached.function.clone(), cached.environment.clone()));
         }
         self.functions.remove(&expression.identity);
 
@@ -284,11 +270,9 @@ impl LuauWorker {
             .load(expression.bytecode.as_ref())
             .set_mode(ChunkMode::Binary)
             .into_function()?;
-        let environment = if expression.readonly {
-            self.readonly_environment(names)?
-        } else {
-            self.environment(names)?
-        };
+        let metatable = self.prepare(&expression.environment)?;
+        let environment = self.lua.create_table()?;
+        environment.set_metatable(Some(metatable))?;
         function.set_environment(environment.clone())?;
         self.functions.insert(
             expression.identity,
@@ -296,77 +280,18 @@ impl LuauWorker {
                 function: function.clone(),
                 environment: environment.clone(),
                 last_access: self.cache_access,
-                names: names.to_vec(),
             },
         );
         Ok((function, environment))
     }
 
-    fn environment(&self, names: &[Box<str>]) -> Result<Table, Error> {
-        let environment = self.lua.create_table()?;
-        let metatable = self.lua.create_table()?;
-        let declared: HashSet<Box<str>> = names.iter().cloned().collect();
-        let globals = self.lua.globals();
-        metatable.set(
-            "__index",
-            self.lua
-                .create_function(move |_, (_, key): (Table, Value)| {
-                    if let Value::String(name) = &key
-                        && declared.contains(name.to_str()?.as_ref())
-                    {
-                        return Ok(Value::Nil);
-                    }
-                    globals.get::<Value>(key)
-                })?,
-        )?;
-        environment.set_metatable(Some(metatable))?;
-        Ok(environment)
-    }
-
-    fn readonly_environment(&self, names: &[Box<str>]) -> Result<Table, Error> {
-        let builtins = self.lua.create_table()?;
-        let globals = self.lua.globals();
-        for name in [
-            "assert", "error", "ipairs", "pairs", "next", "select", "tonumber", "tostring", "type",
-            "typeof",
-        ] {
-            if names.iter().any(|declared| declared.as_ref() == name) {
-                continue;
-            }
-            builtins.set(name, globals.get::<Value>(name)?)?;
+    fn prepare(&mut self, spec: &EnvironmentSpec) -> Result<Table, Error> {
+        if let Some(metatable) = self.environments.get(&spec.identity()) {
+            return Ok(metatable.clone());
         }
-        for name in ["math", "string", "table", "utf8", "bit32", "buffer"] {
-            if names.iter().any(|declared| declared.as_ref() == name) {
-                continue;
-            }
-            let original: Table = globals.get(name)?;
-            let pure = self.lua.create_table()?;
-            for pair in original.pairs::<String, Value>() {
-                let (key, value) = pair?;
-                if !matches!(key.as_str(), "random" | "randomseed") {
-                    pure.set(key, value)?;
-                }
-            }
-            pure.set_readonly(true);
-            builtins.set(name, pure)?;
-        }
-        builtins.set_readonly(true);
-        let environment = self.lua.create_table()?;
-        let metatable = self.lua.create_table()?;
-        metatable.set("__index", builtins)?;
-        // Evaluation populates the environment via raw_set. Authored globals
-        // are disallowed even inside immediately invoked helper functions.
-        metatable.set(
-            "__newindex",
-            self.lua.create_function(|_, _: (Value, Value, Value)| {
-                Err::<(), _>(Error::runtime(
-                    "presentation expressions cannot assign globals",
-                ))
-            })?,
-        )?;
-        metatable.set("__metatable", false)?;
-        environment.set_metatable(Some(metatable))?;
-        Ok(environment)
+        let metatable = spec.materialize(&self.lua)?;
+        self.environments.insert(spec.identity(), metatable.clone());
+        Ok(metatable)
     }
 }
 
@@ -509,6 +434,100 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shared_namespace_survives_function_eviction_without_sharing_input_tables() {
+        let spec = EnvironmentSpec::builder()
+            .library("math", &["random", "randomseed"])
+            .read_only(true)
+            .build()
+            .unwrap();
+        let mut worker = LuauWorker::new();
+        let shared = worker.prepare(&spec).unwrap();
+        let first = spec.compile("math.floor(value)", false).unwrap();
+        let names = [Box::from("value")];
+        assert_eq!(
+            worker
+                .evaluate(&first, &names, &[LuauValue::Number(1.5)], None)
+                .unwrap(),
+            LuauValue::Integer(1)
+        );
+        let first_environment = worker.functions[&first.identity].environment.clone();
+        for index in 0..FUNCTION_CACHE_CAPACITY {
+            let other = spec
+                .compile(&format!("math.floor({index} + 0.5)"), false)
+                .unwrap();
+            worker.evaluate(&other, &[], &[], None).unwrap();
+            let environment = &worker.functions[&other.identity].environment;
+            assert_ne!(environment.to_pointer(), first_environment.to_pointer());
+            assert_eq!(
+                environment.metatable().unwrap().to_pointer(),
+                shared.to_pointer()
+            );
+        }
+        assert!(!worker.functions.contains_key(&first.identity));
+        assert_eq!(
+            worker
+                .evaluate(&first, &names, &[LuauValue::Number(2.5)], None)
+                .unwrap(),
+            LuauValue::Integer(2)
+        );
+        assert_eq!(worker.functions.len(), FUNCTION_CACHE_CAPACITY);
+        assert_eq!(worker.environments.len(), 1);
+        assert_eq!(
+            worker.prepare(&spec).unwrap().to_pointer(),
+            shared.to_pointer()
+        );
+    }
+
+    #[test]
+    fn specifications_isolate_compilation_and_vm_namespaces() {
+        let allowed = EnvironmentSpec::builder()
+            .library("math", &[])
+            .build()
+            .unwrap();
+        let omitted = EnvironmentSpec::builder()
+            .library("math", &["floor"])
+            .build()
+            .unwrap();
+        let a = allowed.cached_expression("math.floor(1.5)", false).unwrap();
+        let b = omitted.cached_expression("math.floor(1.5)", false).unwrap();
+        assert_ne!(a.identity, b.identity);
+        assert_eq!(
+            a.identity,
+            allowed
+                .clone()
+                .cached_expression("math.floor(1.5)", false)
+                .unwrap()
+                .identity
+        );
+        assert_eq!(a.evaluate(&BTreeMap::new()).unwrap(), LuauValue::Integer(1));
+        assert!(b.evaluate(&BTreeMap::new()).is_err());
+        assert!(
+            allowed.cached_expression("true", true).unwrap().identity
+                != allowed.cached_expression("true", false).unwrap().identity
+        );
+        let empty = EnvironmentSpec::builder().build().unwrap();
+        assert_eq!(
+            empty
+                .compile("math", false)
+                .unwrap()
+                .evaluate(&BTreeMap::new())
+                .unwrap(),
+            LuauValue::Nil
+        );
+    }
+
+    fn compile_expression(source: &str, boolean: bool) -> Result<CompiledLuauExpression, Error> {
+        static SPEC: OnceLock<EnvironmentSpec> = OnceLock::new();
+        SPEC.get_or_init(|| {
+            EnvironmentSpec::builder()
+                .globals(["string", "math"])
+                .build()
+                .unwrap()
+        })
+        .compile(source, boolean)
+    }
+
+    #[test]
     fn persists_portable_sequences_and_records() {
         let expression =
             compile_expression("{ values = { 1, 2, 3 }, enabled = true }", false).unwrap();
@@ -580,13 +599,11 @@ mod tests {
     }
 
     #[test]
-    fn declared_nil_values_shadow_sandbox_globals() {
+    fn contextual_inputs_cannot_shadow_builtins() {
         let expression = compile_expression("math", false).unwrap();
 
-        assert_eq!(
-            evaluate(&expression, &[Box::from("math")], &[LuauValue::Nil], None,).unwrap(),
-            LuauValue::Nil
-        );
+        assert!(evaluate(&expression, &[], &[], Some(("math", &LuauValue::Nil))).is_err());
+        assert!(evaluate(&expression, &[Box::from("math")], &[LuauValue::Nil], None).is_err());
     }
 
     #[test]
