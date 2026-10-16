@@ -1,0 +1,21 @@
+[package]
+name = "bevy_luau"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Portable Luau expressions with native fast paths for Bevy authoring"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+full_moon = { version = "2.2.0", features = ["luau"] }
+mlua = { version = "0.11", features = ["luau", "vendored"] }
+
+[[bench]]
+name = "expressions"
+harness = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
