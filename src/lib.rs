@@ -2,6 +2,7 @@
 //! This crate has no Bevy dependency and retains no VM handles in compiled assets.
 mod environment;
 mod native;
+pub mod numeric;
 
 pub use environment::{EnvironmentBuilder, EnvironmentSpec};
 pub use mlua::Error;
