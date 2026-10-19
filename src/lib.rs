@@ -3,6 +3,8 @@
 mod environment;
 mod native;
 pub mod numeric;
+#[cfg(feature = "serde")]
+mod persistence;
 
 pub use environment::{EnvironmentBuilder, EnvironmentSpec};
 pub use mlua::Error;
@@ -40,6 +42,10 @@ pub enum LuauValue {
 
 #[derive(Clone, Debug)]
 pub struct CompiledLuauExpression {
+    #[cfg(feature = "serde")]
+    source: Box<str>,
+    #[cfg(feature = "serde")]
+    boolean: bool,
     identity: u64,
     pub bytecode: Box<[u8]>,
     /// Conservative root dependencies; includes names used in nested expressions.
@@ -107,6 +113,10 @@ impl EnvironmentSpec {
         let mut dependencies = native::Dependencies::default();
         dependencies.visit_ast(&ast);
         Ok(CompiledLuauExpression {
+            #[cfg(feature = "serde")]
+            source: expression.into(),
+            #[cfg(feature = "serde")]
+            boolean,
             identity: NEXT_EXPRESSION_ID.fetch_add(1, Ordering::Relaxed),
             bytecode: bytecode.into_boxed_slice(),
             dependencies: dependencies.roots.into_iter().collect(),

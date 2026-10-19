@@ -11,6 +11,7 @@ use std::{
 static NEXT_ENVIRONMENT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 enum Export {
     Global,
     Library(Vec<String>),
@@ -20,6 +21,50 @@ enum Export {
 /// VM handles. Each evaluating thread materializes its own shared builtin tables.
 #[derive(Clone, Debug)]
 pub struct EnvironmentSpec(Arc<Definition>);
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for EnvironmentSpec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (&self.0.exports, self.0.read_only).serialize(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for EnvironmentSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use std::sync::{Mutex, OnceLock, Weak};
+        type Key = (Vec<(String, Option<Vec<String>>)>, bool);
+        static RESTORED: OnceLock<Mutex<BTreeMap<Key, Weak<Definition>>>> = OnceLock::new();
+        let (exports, read_only) = <(BTreeMap<String, Export>, bool)>::deserialize(deserializer)?;
+        let key = (
+            exports
+                .iter()
+                .map(|(name, export)| {
+                    (
+                        name.clone(),
+                        match export {
+                            Export::Global => None,
+                            Export::Library(excluded) => Some(excluded.clone()),
+                        },
+                    )
+                })
+                .collect(),
+            read_only,
+        );
+        let mut restored = RESTORED.get_or_init(Default::default).lock().unwrap();
+        if let Some(definition) = restored.get(&key).and_then(Weak::upgrade) {
+            return Ok(Self(definition));
+        }
+        let definition = Arc::new(Definition {
+            identity: NEXT_ENVIRONMENT_ID.fetch_add(1, Ordering::Relaxed),
+            exports,
+            read_only,
+        });
+        restored.retain(|_, value| value.strong_count() > 0);
+        restored.insert(key, Arc::downgrade(&definition));
+        Ok(Self(definition))
+    }
+}
 
 #[derive(Debug)]
 struct Definition {

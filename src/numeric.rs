@@ -5,6 +5,10 @@ use full_moon::ast::{Expression, FunctionArgs, Index, LastStmt, Prefix, Suffix, 
 
 #[derive(Clone, Debug)]
 pub struct NumericExpression {
+    #[cfg(feature = "serde")]
+    source: String,
+    #[cfg(feature = "serde")]
+    input_names: Vec<String>,
     plan: Node,
     inputs: usize,
     /// Referenced input indices, sorted and deduplicated, for consumer invalidation.
@@ -72,6 +76,10 @@ impl NumericExpression {
         dependencies.sort_unstable();
         dependencies.dedup();
         Ok(Self {
+            #[cfg(feature = "serde")]
+            source: source.into(),
+            #[cfg(feature = "serde")]
+            input_names: inputs.iter().map(|name| (*name).into()).collect(),
             plan,
             inputs: inputs.len(),
             dependencies,
@@ -85,6 +93,22 @@ impl NumericExpression {
             return Err("numeric input schema mismatch");
         }
         self.plan.evaluate(inputs)?.number()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for NumericExpression {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (&self.source, &self.input_names).serialize(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for NumericExpression {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (source, inputs) = <(String, Vec<String>)>::deserialize(deserializer)?;
+        let inputs: Vec<_> = inputs.iter().map(String::as_str).collect();
+        Self::compile(&source, &inputs).map_err(serde::de::Error::custom)
     }
 }
 
