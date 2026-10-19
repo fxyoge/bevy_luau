@@ -6,6 +6,7 @@
   "separateMajorMinor": false,
   "pinDigests": true,
   "minimumReleaseAge": "7 days",
+  "internalChecksFilter": "strict",
   "automergeType": "pr",
   "automerge": true,
   "platformAutomerge": false
