@@ -47,7 +47,7 @@ pub struct CompiledLuauExpression {
     #[cfg(feature = "serde")]
     boolean: bool,
     identity: u64,
-    pub bytecode: Box<[u8]>,
+    bytecode: Box<[u8]>,
     /// Conservative root dependencies; includes names used in nested expressions.
     pub dependencies: Vec<String>,
     native: Option<native::Plan>,
