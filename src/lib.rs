@@ -61,17 +61,32 @@ impl CompiledLuauExpression {
 
     /// Evaluate with this expression's configured namespace and input policy.
     pub fn evaluate(&self, inputs: &BTreeMap<String, LuauValue>) -> Result<LuauValue, Error> {
-        let names: Vec<Box<str>> = inputs.keys().map(|name| name.as_str().into()).collect();
-        let values: Vec<_> = inputs.values().cloned().collect();
-        evaluate(self, &names, &values, None)
+        evaluate_inputs(
+            self,
+            inputs.iter().map(|(name, value)| (name.as_str(), value)),
+            None,
+        )
+    }
+
+    /// Evaluate borrowed named inputs without cloning their records or sequences.
+    /// Input names must be unique. Only the returned portable result is owned;
+    /// VM fallback still creates private input tables for each call.
+    pub fn evaluate_borrowed(&self, inputs: &[(&str, &LuauValue)]) -> Result<LuauValue, Error> {
+        evaluate_inputs(self, inputs.iter().copied(), None)
     }
 
     /// Useful for parity checks and measuring the native execution strategy.
     pub fn evaluate_vm(&self, inputs: &BTreeMap<String, LuauValue>) -> Result<LuauValue, Error> {
-        let names: Vec<Box<str>> = inputs.keys().map(|name| name.as_str().into()).collect();
-        let values: Vec<_> = inputs.values().cloned().collect();
-        validate_inputs(self, &names, &values, None)?;
-        WORKER.with_borrow_mut(|worker| worker.evaluate(self, &names, &values, None))
+        for name in inputs.keys() {
+            self.environment.validate_input_name(name)?;
+        }
+        WORKER.with_borrow_mut(|worker| {
+            worker.evaluate(
+                self,
+                inputs.iter().map(|(name, value)| (name.as_str(), value)),
+                None,
+            )
+        })
     }
 }
 
@@ -142,35 +157,49 @@ pub fn evaluate(
     values: &[LuauValue],
     extra: Option<(&str, &LuauValue)>,
 ) -> Result<LuauValue, Error> {
-    validate_inputs(expression, names, values, extra)?;
-    if let Some(plan) = &expression.native {
-        // Undeclared roots may address builtins and must use the VM.
-        if plan.roots_declared(names, extra.map(|(name, _)| name)) {
-            let value = plan.evaluate(names, values, extra)?;
-            return native::normalize(value);
-        }
-    }
-    WORKER.with_borrow_mut(|worker| worker.evaluate(expression, names, values, extra))
-}
-
-fn validate_inputs(
-    expression: &CompiledLuauExpression,
-    names: &[Box<str>],
-    values: &[LuauValue],
-    extra: Option<(&str, &LuauValue)>,
-) -> Result<(), Error> {
     if names.len() != values.len() {
         return Err(Error::runtime(
             "expression input names and values must have equal lengths",
         ));
     }
-    for name in names {
+    evaluate_inputs(
+        expression,
+        names
+            .iter()
+            .zip(values)
+            .map(|(name, value)| (name.as_ref(), value)),
+        extra,
+    )
+}
+
+fn evaluate_inputs<'a>(
+    expression: &CompiledLuauExpression,
+    inputs: impl Iterator<Item = (&'a str, &'a LuauValue)> + Clone,
+    extra: Option<(&str, &LuauValue)>,
+) -> Result<LuauValue, Error> {
+    for (name, _) in inputs.clone() {
         expression.environment.validate_input_name(name)?;
     }
     if let Some((name, _)) = extra {
         expression.environment.validate_input_name(name)?;
     }
-    Ok(())
+    let lookup = |root: &str| {
+        extra
+            .filter(|(name, _)| *name == root)
+            .map(|(_, value)| value)
+            .or_else(|| {
+                inputs
+                    .clone()
+                    .find_map(|(name, value)| (name == root).then_some(value))
+            })
+    };
+    if let Some(plan) = &expression.native
+        // Undeclared roots may address builtins and must use the VM.
+        && plan.roots_declared(&lookup)
+    {
+        return native::normalize(plan.evaluate(&lookup)?);
+    }
+    WORKER.with_borrow_mut(|worker| worker.evaluate(expression, inputs, extra))
 }
 
 struct LuauWorker {
@@ -213,11 +242,10 @@ impl LuauWorker {
         }
     }
 
-    fn evaluate(
+    fn evaluate<'a>(
         &mut self,
         expression: &CompiledLuauExpression,
-        names: &[Box<str>],
-        values: &[LuauValue],
+        inputs: impl Iterator<Item = (&'a str, &'a LuauValue)>,
         extra: Option<(&str, &LuauValue)>,
     ) -> Result<LuauValue, Error> {
         self.interrupts.set(0);
@@ -225,18 +253,15 @@ impl LuauWorker {
         environment.set_readonly(false);
         environment.clear()?;
 
-        for (name, value) in names.iter().zip(values) {
+        for (name, value) in inputs {
             if !expression.environment.read_only()
-                || expression
-                    .dependencies
-                    .iter()
-                    .any(|root| root == name.as_ref())
+                || expression.dependencies.iter().any(|root| root == name)
             {
                 let value = to_lua(&self.lua, value)?;
                 if expression.environment.read_only() {
                     freeze(&value)?;
                 }
-                environment.raw_set(name.as_ref(), value)?;
+                environment.raw_set(name, value)?;
             }
         }
         if let Some((name, value)) = extra {
@@ -318,14 +343,15 @@ fn freeze(value: &Value) -> Result<(), Error> {
 
 // Strings have Luau's standard string-library __index behavior. Delegate this
 // uncommon read to the VM rather than approximating its metatable in Rust.
-fn string_index(key: &LuauValue) -> Result<native::Evaluated, Error> {
+fn string_index(key: &LuauValue) -> Result<native::Evaluated<'static>, Error> {
     WORKER.with_borrow(|worker| {
         let library: Table = worker.lua.globals().get("string")?;
         let value = library.raw_get::<Value>(to_lua(&worker.lua, key)?)?;
         if matches!(value, Value::Function(_)) {
             Ok(native::Evaluated::Function)
         } else {
-            from_lua(value, &mut Conversion::new(), 0).map(native::Evaluated::Portable)
+            from_lua(value, &mut Conversion::new(), 0)
+                .map(|v| native::Evaluated::Portable(std::borrow::Cow::Owned(v)))
         }
     })
 }
@@ -454,10 +480,13 @@ mod tests {
         let mut worker = LuauWorker::new();
         let shared = worker.prepare(&spec).unwrap();
         let first = spec.compile("math.floor(value)", false).unwrap();
-        let names = [Box::from("value")];
         assert_eq!(
             worker
-                .evaluate(&first, &names, &[LuauValue::Number(1.5)], None)
+                .evaluate(
+                    &first,
+                    [("value", &LuauValue::Number(1.5))].into_iter(),
+                    None
+                )
                 .unwrap(),
             LuauValue::Integer(1)
         );
@@ -466,7 +495,7 @@ mod tests {
             let other = spec
                 .compile(&format!("math.floor({index} + 0.5)"), false)
                 .unwrap();
-            worker.evaluate(&other, &[], &[], None).unwrap();
+            worker.evaluate(&other, std::iter::empty(), None).unwrap();
             let environment = &worker.functions[&other.identity].environment;
             assert_ne!(environment.to_pointer(), first_environment.to_pointer());
             assert_eq!(
@@ -477,7 +506,11 @@ mod tests {
         assert!(!worker.functions.contains_key(&first.identity));
         assert_eq!(
             worker
-                .evaluate(&first, &names, &[LuauValue::Number(2.5)], None)
+                .evaluate(
+                    &first,
+                    [("value", &LuauValue::Number(2.5))].into_iter(),
+                    None
+                )
                 .unwrap(),
             LuauValue::Integer(2)
         );

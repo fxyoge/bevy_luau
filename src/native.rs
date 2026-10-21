@@ -1,4 +1,7 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeSet, HashMap, HashSet},
+};
 
 use crate::{Error, LuauValue as V};
 use full_moon::{
@@ -106,95 +109,98 @@ fn expression(value: &Expression) -> Option<Plan> {
     })
 }
 
-pub(crate) enum Evaluated {
-    Portable(V),
+pub(crate) enum Evaluated<'a> {
+    Portable(Cow<'a, V>),
     // String metatable reads can produce a builtin function as an intermediate
     // value. It is truthy, but cannot escape as a portable result.
     Function,
 }
 
-fn truthy(value: &Evaluated) -> bool {
-    !matches!(value, Evaluated::Portable(V::Nil | V::Boolean(false)))
+fn truthy(value: &Evaluated<'_>) -> bool {
+    !matches!(value, Evaluated::Portable(value) if matches!(value.as_ref(), V::Nil | V::Boolean(false)))
 }
 
 impl Plan {
-    pub(crate) fn roots_declared(&self, names: &[Box<str>], extra: Option<&str>) -> bool {
+    pub(crate) fn roots_declared<'a>(&self, lookup: &impl Fn(&str) -> Option<&'a V>) -> bool {
         match self {
-            Self::Root(root) => {
-                extra == Some(root.as_str()) || names.iter().any(|name| name.as_ref() == root)
-            }
-            Self::Index(a, b) => a.roots_declared(names, extra) && b.roots_declared(names, extra),
-            Self::Not(a) => a.roots_declared(names, extra),
+            Self::Root(root) => lookup(root).is_some(),
+            Self::Index(a, b) => a.roots_declared(lookup) && b.roots_declared(lookup),
+            Self::Not(a) => a.roots_declared(lookup),
             Self::If(a, b, c) => {
-                a.roots_declared(names, extra)
-                    && b.roots_declared(names, extra)
-                    && c.roots_declared(names, extra)
+                a.roots_declared(lookup) && b.roots_declared(lookup) && c.roots_declared(lookup)
             }
             Self::Literal(_) => true,
         }
     }
 
-    pub(crate) fn evaluate(
-        &self,
-        names: &[Box<str>],
-        values: &[V],
-        extra: Option<(&str, &V)>,
+    pub(crate) fn evaluate<'a>(
+        &'a self,
+        lookup: &impl Fn(&str) -> Option<&'a V>,
     ) -> Result<V, Error> {
-        match self.evaluate_value(names, values, extra)? {
-            Evaluated::Portable(value) => Ok(value),
+        match self.evaluate_value(lookup)? {
+            Evaluated::Portable(value) => Ok(value.into_owned()),
             Evaluated::Function => Err(Error::runtime("Luau function values cannot be persisted")),
         }
     }
 
-    fn evaluate_value(
-        &self,
-        names: &[Box<str>],
-        values: &[V],
-        extra: Option<(&str, &V)>,
-    ) -> Result<Evaluated, Error> {
+    fn evaluate_value<'a>(
+        &'a self,
+        lookup: &impl Fn(&str) -> Option<&'a V>,
+    ) -> Result<Evaluated<'a>, Error> {
         use Evaluated::Portable as P;
-        let eval = |plan: &Self| plan.evaluate_value(names, values, extra);
+        let eval = |plan: &'a Self| plan.evaluate_value(lookup);
         Ok(match self {
-            Self::Literal(value) => P(value.clone()),
-            Self::Root(root) => {
-                if let Some((_, value)) = extra.filter(|(name, _)| *name == root) {
-                    P(value.clone())
-                } else if let Some(index) = names.iter().position(|name| name.as_ref() == root) {
-                    P(values[index].clone())
-                } else {
-                    P(V::Nil)
-                }
-            }
-            Self::Not(value) => P(V::Boolean(!truthy(&eval(value)?))),
+            Self::Literal(value) => P(Cow::Borrowed(value)),
+            Self::Root(root) => P(Cow::Borrowed(lookup(root).unwrap_or(&V::Nil))),
+            Self::Not(value) => P(Cow::Owned(V::Boolean(!truthy(&eval(value)?)))),
             Self::If(condition, yes, no) => eval(if truthy(&eval(condition)?) { yes } else { no })?,
             Self::Index(value, key) => {
                 let value = eval(value)?;
                 let key = eval(key)?;
-                match (&value, &key) {
-                    (P(V::Record(record)), P(V::String(key))) => {
-                        P(record.get(key).cloned().unwrap_or(V::Nil))
-                    }
-                    (P(V::Record(_)), _) => P(V::Nil),
-                    (P(V::Sequence(sequence)), P(V::Integer(index))) if *index > 0 => P(sequence
-                        .get((*index - 1) as usize)
-                        .cloned()
-                        .unwrap_or(V::Nil)),
-                    (P(V::Sequence(sequence)), P(V::Number(index)))
-                        if index.fract() == 0.0 && *index >= 1.0 && *index <= usize::MAX as f64 =>
-                    {
-                        P(sequence
-                            .get((*index as usize).saturating_sub(1))
-                            .cloned()
-                            .unwrap_or(V::Nil))
-                    }
-                    (P(V::Sequence(_)), _) => P(V::Nil),
-                    (P(V::String(_)), P(key)) => crate::string_index(key)?,
-                    (P(V::String(_)), Evaluated::Function) => P(V::Nil),
-                    _ => return Err(Error::runtime("attempt to index a non-table value")),
-                }
+                index(value, &key)?
             }
         })
     }
+}
+
+fn index<'a>(value: Evaluated<'a>, key: &Evaluated<'_>) -> Result<Evaluated<'a>, Error> {
+    use Evaluated::Portable as P;
+    // Most native intermediates borrow the original input. An owned intermediate
+    // (e.g. a VM string-library lookup) must own its selected result as well.
+    if let P(Cow::Owned(value)) = value {
+        return index(P(Cow::Borrowed(&value)), key).map(|result| match result {
+            P(value) => P(Cow::Owned(value.into_owned())),
+            Evaluated::Function => Evaluated::Function,
+        });
+    }
+    let borrowed = |value| P(Cow::Borrowed(value));
+    Ok(match (value, key) {
+        (P(Cow::Borrowed(V::Record(record))), P(key)) => match key.as_ref() {
+            V::String(key) => borrowed(record.get(key).unwrap_or(&V::Nil)),
+            _ => borrowed(&V::Nil),
+        },
+        (P(Cow::Borrowed(V::Record(_))), _) => borrowed(&V::Nil),
+        (P(Cow::Borrowed(V::Sequence(sequence))), P(key)) => {
+            let index = match key.as_ref() {
+                V::Integer(index) if *index > 0 => Some((*index - 1) as usize),
+                V::Number(index)
+                    if index.fract() == 0.0 && *index >= 1.0 && *index <= usize::MAX as f64 =>
+                {
+                    Some((*index as usize).saturating_sub(1))
+                }
+                _ => None,
+            };
+            borrowed(
+                index
+                    .and_then(|index| sequence.get(index))
+                    .unwrap_or(&V::Nil),
+            )
+        }
+        (P(Cow::Borrowed(V::Sequence(_))), _) => borrowed(&V::Nil),
+        (P(Cow::Borrowed(V::String(_))), P(key)) => crate::string_index(key)?,
+        (P(Cow::Borrowed(V::String(_))), Evaluated::Function) => borrowed(&V::Nil),
+        _ => return Err(Error::runtime("attempt to index a non-table value")),
+    })
 }
 
 /// Match Luau's double-based numbers and table persistence representation.

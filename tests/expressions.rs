@@ -74,6 +74,16 @@ fn native_reads_match_vm_semantics() {
             expression.evaluate_vm(&inputs()).unwrap(),
             "{source}"
         );
+        let data = inputs();
+        let borrowed: Vec<_> = data
+            .iter()
+            .map(|(name, value)| (name.as_str(), value))
+            .collect();
+        assert_eq!(
+            expression.evaluate_borrowed(&borrowed).unwrap(),
+            expression.evaluate_vm(&data).unwrap(),
+            "borrowed: {source}"
+        );
     }
 }
 
@@ -91,6 +101,15 @@ fn vm_fallback_supports_records_helpers_and_pure_functions() {
             expression.evaluate(&inputs()).unwrap(),
             expression.evaluate_vm(&inputs()).unwrap()
         );
+        let data = inputs();
+        let borrowed: Vec<_> = data
+            .iter()
+            .map(|(name, value)| (name.as_str(), value))
+            .collect();
+        assert_eq!(
+            expression.evaluate_borrowed(&borrowed).unwrap(),
+            expression.evaluate_vm(&data).unwrap()
+        );
     }
 }
 
@@ -107,6 +126,15 @@ fn readonly_inputs_and_globals_are_deeply_immutable() {
         "require('anything')",
     ] {
         let expression = compile_readonly(source).unwrap();
+        let data = inputs();
+        let borrowed: Vec<_> = data
+            .iter()
+            .map(|(name, value)| (name.as_str(), value))
+            .collect();
+        assert!(
+            expression.evaluate_borrowed(&borrowed).is_err(),
+            "borrowed: {source}"
+        );
         assert!(expression.evaluate(&inputs()).is_err(), "{source}");
         assert!(
             expression.evaluate(&inputs()).is_err(),
@@ -140,11 +168,38 @@ fn builtin_collisions_fail_before_both_native_and_vm_execution() {
         );
         assert!(expression.evaluate_vm(&inputs).is_err());
         assert!(compile_readonly("42").unwrap().evaluate(&inputs).is_err());
+        assert!(
+            compile_readonly("42")
+                .unwrap()
+                .evaluate_borrowed(&[("math", inputs.get("math").unwrap())])
+                .is_err()
+        );
     }
     assert_eq!(
         expression.evaluate(&BTreeMap::new()).unwrap(),
         V::String("table".into())
     );
+}
+
+#[test]
+fn borrowed_reads_own_results_and_preserve_conversion_errors() {
+    let mut data = BTreeMap::from([("rows".into(), V::Sequence(vec![V::Integer(7); 100_001]))]);
+    for source in ["rows[1]", "rows", "rows[0]", "rows.missing", "rows[1].bad"] {
+        let expression = compile_readonly(source).unwrap();
+        let borrowed = expression.evaluate_borrowed(&[("rows", &data["rows"])]);
+        let vm = expression.evaluate_vm(&data);
+        match (borrowed, vm) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "{source}"),
+            (Err(_), Err(_)) => (),
+            other => panic!("borrowed/VM mismatch for {source}: {other:?}"),
+        }
+    }
+    let result = compile_readonly("rows[1]")
+        .unwrap()
+        .evaluate_borrowed(&[("rows", &data["rows"])])
+        .unwrap();
+    data.clear();
+    assert_eq!(result, V::Integer(7));
 }
 
 #[test]
