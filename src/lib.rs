@@ -64,7 +64,7 @@ impl CompiledLuauExpression {
         evaluate_inputs(
             self,
             inputs.iter().map(|(name, value)| (name.as_str(), value)),
-            None,
+            std::iter::empty(),
         )
     }
 
@@ -72,7 +72,7 @@ impl CompiledLuauExpression {
     /// Input names must be unique. Only the returned portable result is owned;
     /// VM fallback still creates private input tables for each call.
     pub fn evaluate_borrowed(&self, inputs: &[(&str, &LuauValue)]) -> Result<LuauValue, Error> {
-        evaluate_inputs(self, inputs.iter().copied(), None)
+        evaluate_inputs(self, inputs.iter().copied(), std::iter::empty())
     }
 
     /// Useful for parity checks and measuring the native execution strategy.
@@ -84,7 +84,7 @@ impl CompiledLuauExpression {
             worker.evaluate(
                 self,
                 inputs.iter().map(|(name, value)| (name.as_str(), value)),
-                None,
+                std::iter::empty(),
             )
         })
     }
@@ -149,14 +149,19 @@ thread_local! {
     static WORKER: RefCell<LuauWorker> = RefCell::new(LuauWorker::new());
 }
 
-/// Evaluate named inputs with an optional contextual binding. The contextual
-/// binding shadows an ordinary input with the same name; its root is immutable.
-pub fn evaluate(
+/// Evaluate named inputs with contextual bindings. Context shadows ordinary
+/// inputs with the same name and is recursively immutable. `Option` supplies
+/// one contextual binding without allocating; arrays can supply several.
+pub fn evaluate<'a, C>(
     expression: &CompiledLuauExpression,
-    names: &[Box<str>],
-    values: &[LuauValue],
-    extra: Option<(&str, &LuauValue)>,
-) -> Result<LuauValue, Error> {
+    names: &'a [Box<str>],
+    values: &'a [LuauValue],
+    extra: C,
+) -> Result<LuauValue, Error>
+where
+    C: IntoIterator<Item = (&'a str, &'a LuauValue)>,
+    C::IntoIter: Clone,
+{
     if names.len() != values.len() {
         return Err(Error::runtime(
             "expression input names and values must have equal lengths",
@@ -168,24 +173,25 @@ pub fn evaluate(
             .iter()
             .zip(values)
             .map(|(name, value)| (name.as_ref(), value)),
-        extra,
+        extra.into_iter(),
     )
 }
 
 fn evaluate_inputs<'a>(
     expression: &CompiledLuauExpression,
     inputs: impl Iterator<Item = (&'a str, &'a LuauValue)> + Clone,
-    extra: Option<(&str, &LuauValue)>,
+    extra: impl Iterator<Item = (&'a str, &'a LuauValue)> + Clone,
 ) -> Result<LuauValue, Error> {
     for (name, _) in inputs.clone() {
         expression.environment.validate_input_name(name)?;
     }
-    if let Some((name, _)) = extra {
+    for (name, _) in extra.clone() {
         expression.environment.validate_input_name(name)?;
     }
     let lookup = |root: &str| {
         extra
-            .filter(|(name, _)| *name == root)
+            .clone()
+            .find(|(name, _)| *name == root)
             .map(|(_, value)| value)
             .or_else(|| {
                 inputs
@@ -246,7 +252,7 @@ impl LuauWorker {
         &mut self,
         expression: &CompiledLuauExpression,
         inputs: impl Iterator<Item = (&'a str, &'a LuauValue)>,
-        extra: Option<(&str, &LuauValue)>,
+        extra: impl IntoIterator<Item = (&'a str, &'a LuauValue)>,
     ) -> Result<LuauValue, Error> {
         self.interrupts.set(0);
         let (function, environment) = self.function(expression)?;
@@ -264,13 +270,9 @@ impl LuauWorker {
                 environment.raw_set(name, value)?;
             }
         }
-        if let Some((name, value)) = extra {
+        for (name, value) in extra {
             let value = to_lua(&self.lua, value)?;
-            if expression.environment.read_only() {
-                freeze(&value)?;
-            } else if let Value::Table(table) = &value {
-                table.set_readonly(true);
-            }
+            freeze(&value)?;
             environment.raw_set(name, value)?;
         }
 
