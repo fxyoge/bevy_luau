@@ -1,5 +1,5 @@
 //! Consumer-defined, VM-independent expression namespaces.
-use mlua::{Error, Lua, Table, Value};
+use mlua::{Error, Function, Lua, Table, Value};
 use std::{
     collections::BTreeMap,
     sync::{
@@ -10,11 +10,12 @@ use std::{
 
 static NEXT_ENVIRONMENT_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 enum Export {
     Global,
     Library(Vec<String>),
+    Map,
 }
 
 /// Immutable namespace and input policy. Clones share an identity, but contain no
@@ -33,24 +34,10 @@ impl serde::Serialize for EnvironmentSpec {
 impl<'de> serde::Deserialize<'de> for EnvironmentSpec {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use std::sync::{Mutex, OnceLock, Weak};
-        type Key = (Vec<(String, Option<Vec<String>>)>, bool);
+        type Key = (BTreeMap<String, Export>, bool);
         static RESTORED: OnceLock<Mutex<BTreeMap<Key, Weak<Definition>>>> = OnceLock::new();
         let (exports, read_only) = <(BTreeMap<String, Export>, bool)>::deserialize(deserializer)?;
-        let key = (
-            exports
-                .iter()
-                .map(|(name, export)| {
-                    (
-                        name.clone(),
-                        match export {
-                            Export::Global => None,
-                            Export::Library(excluded) => Some(excluded.clone()),
-                        },
-                    )
-                })
-                .collect(),
-            read_only,
-        );
+        let key = (exports.clone(), read_only);
         let mut restored = RESTORED.get_or_init(Default::default).lock().unwrap();
         if let Some(definition) = restored.get(&key).and_then(Weak::upgrade) {
             return Ok(Self(definition));
@@ -112,6 +99,10 @@ impl EnvironmentSpec {
         let builtins = lua.create_table()?;
         let globals = lua.globals();
         for (name, export) in &self.0.exports {
+            if matches!(export, Export::Map) {
+                builtins.raw_set(name.as_str(), map_function(lua)?)?;
+                continue;
+            }
             let value: Value = globals.get(name.as_str())?;
             if value.is_nil() {
                 return Err(Error::runtime(format!("unknown builtin `{name}`")));
@@ -136,6 +127,7 @@ impl EnvironmentSpec {
                     library.set_readonly(true);
                     builtins.raw_set(name.as_str(), library)?;
                 }
+                Export::Map => unreachable!(),
             }
         }
         builtins.set_readonly(true);
@@ -158,6 +150,14 @@ impl EnvironmentSpec {
 }
 
 impl EnvironmentBuilder {
+    /// Expose `map(sequence, callback)`. Each element is transformed in order;
+    /// nil results are omitted, while false and zero are retained. The callback
+    /// receives the element, and the result is always a dense sequence.
+    pub fn map(mut self) -> Self {
+        self.insert("map".into(), Export::Map);
+        self
+    }
+
     fn insert(&mut self, name: String, export: Export) {
         if self.exports.insert(name.clone(), export).is_some() {
             self.duplicate = Some(name);
@@ -198,4 +198,31 @@ impl EnvironmentBuilder {
             read_only: self.read_only,
         })))
     }
+}
+
+fn map_function(lua: &Lua) -> Result<Function, Error> {
+    // Keep traversal in Luau so it shares the expression's instruction budget,
+    // including callbacks that return native reads or constants.
+    lua.load(
+        "return function(values, transform)
+            if type(values) ~= 'table' then error('map expects a dense sequence') end
+            if type(transform) ~= 'function' then error('map expects a callback') end
+            local length = #values
+            local entries = 0
+            for key in values do
+                if type(key) ~= 'number' or key % 1 ~= 0 or key < 1 or key > length then
+                    error('map expects a dense sequence')
+                end
+                entries += 1
+            end
+            if entries ~= length then error('map expects a dense sequence') end
+            local result = {}
+            for i = 1, length do
+                local value = transform(values[i])
+                if value ~= nil then result[#result + 1] = value end
+            end
+            return result
+        end",
+    )
+    .eval()
 }
