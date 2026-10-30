@@ -2,8 +2,10 @@ name: CI
 
 on:
   push:
+    branches: [ main ]
   pull_request:
   workflow_dispatch:
+
 
 permissions:
   contents: read
@@ -25,22 +27,22 @@ jobs:
       RUSTUP_TOOLCHAIN: stable
       RUSTDOCFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - name: Install Rust
-        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy --no-self-update
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
-        with:
-          key: quality
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Clippy (default features)
-        run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Clippy (all features)
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Build documentation
-        run: cargo doc --locked --no-deps --all-features
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        persist-credentials: false
+    - name: Install Rust
+      run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy --no-self-update
+    - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+      with:
+        key: quality
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+    - name: Clippy (default features)
+      run: cargo clippy --locked --all-targets -- -D warnings
+    - name: Clippy (all features)
+      run: cargo clippy --locked --all-targets --all-features -- -D warnings
+    - name: Build documentation
+      run: cargo doc --locked --no-deps --all-features
 
   test:
     name: Test (${{ matrix.os }}, Rust ${{ matrix.rust }}, ${{ matrix.features || 'default' }})
@@ -49,31 +51,31 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        rust: [stable]
-        features: ['', serde]
+        os: [ ubuntu-latest, windows-latest, macos-latest ]
+        rust: [ stable ]
+        features: [ '', serde ]
         include:
-          - os: ubuntu-latest
-            rust: '1.95'
-            features: ''
-          - os: ubuntu-latest
-            rust: '1.95'
-            features: serde
+        - os: ubuntu-latest
+          rust: '1.95'
+          features: ''
+        - os: ubuntu-latest
+          rust: '1.95'
+          features: serde
     env:
       RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - name: Install Rust
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
-        with:
-          key: test-${{ matrix.features || 'default' }}
-      - name: Run tests and doctests
-        run: cargo test --locked --no-default-features --features "${{ matrix.features }}"
-      - name: Check benchmarks
-        run: cargo check --locked --benches --no-default-features --features "${{ matrix.features }}"
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        persist-credentials: false
+    - name: Install Rust
+      run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+    - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+      with:
+        key: test-${{ matrix.features || 'default' }}
+    - name: Run tests and doctests
+      run: cargo test --locked --no-default-features --features "${{ matrix.features }}"
+    - name: Check benchmarks
+      run: cargo check --locked --benches --no-default-features --features "${{ matrix.features }}"
