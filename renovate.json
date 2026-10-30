@@ -3,11 +3,16 @@
   "extends": [
     "config:recommended"
   ],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "automerge": true
+  },
   "separateMajorMinor": false,
   "pinDigests": true,
   "minimumReleaseAge": "7 days",
   "internalChecksFilter": "strict",
   "automergeType": "pr",
+  "automergeStrategy": "rebase",
   "automerge": true,
   "platformAutomerge": false
 }
