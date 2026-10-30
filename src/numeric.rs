@@ -22,6 +22,7 @@ enum Node {
     Input(usize),
     Unary(String, Box<Node>),
     Binary(String, Box<Node>, Box<Node>),
+    Modulo(Box<Node>, Box<Node>, bool),
     If(Box<Node>, Box<Node>, Box<Node>),
     Call(String, Vec<Node>),
 }
@@ -192,7 +193,11 @@ fn compile(
             } else if left.boolean() || right.boolean() {
                 return Err("arithmetic and ordering require numeric operands".into());
             }
-            Node::Binary(op, Box::new(left), Box::new(right))
+            if op == "%" {
+                Node::Modulo(Box::new(left), Box::new(right), modulo_uses_fma()?)
+            } else {
+                Node::Binary(op, Box::new(left), Box::new(right))
+            }
         }
         Expression::IfExpression(value) => {
             let condition = child(value.condition())?;
@@ -255,6 +260,25 @@ fn compile(
     Ok(plan)
 }
 
+fn modulo_uses_fma() -> Result<bool, String> {
+    static FUSED: std::sync::OnceLock<Result<bool, String>> = std::sync::OnceLock::new();
+    FUSED
+        .get_or_init(|| {
+            // C++ compilers may contract Luau's modulo multiply-subtract, unlike Rust.
+            // Probe runtime operands so constant folding cannot hide the VM's behavior.
+            // Human here: I suspect there's a better way to do this. f the get_or_init
+            // proves too expensive then ... PRs are open!
+            let lua = mlua::Lua::new();
+            let probe = || -> mlua::Result<bool> {
+                let modulo: mlua::Function =
+                    lua.load("return function(a, b) return a % b end").eval()?;
+                Ok(modulo.call::<f64>((1e30, 3.0))? != 0.0)
+            };
+            probe().map_err(|e| e.to_string())
+        })
+        .clone()
+}
+
 fn static_path<'a>(
     prefix: &Prefix,
     suffixes: impl Iterator<Item = &'a Suffix>,
@@ -307,6 +331,16 @@ impl Node {
                 no
             }
             .evaluate(inputs)?,
+            Self::Modulo(left, right, fused) => {
+                let a = left.evaluate(inputs)?.number()?;
+                let b = right.evaluate(inputs)?.number()?;
+                let quotient = (a / b).floor();
+                N(if *fused {
+                    (-quotient).mul_add(b, a)
+                } else {
+                    a - quotient * b
+                })
+            }
             Self::Binary(op, left, right) => {
                 let left = left.evaluate(inputs)?;
                 if op == "and" {
@@ -339,7 +373,6 @@ impl Node {
                         "*" => N(a * b),
                         "/" => N(a / b),
                         "//" => N((a / b).floor()),
-                        "%" => N(a - (a / b).floor() * b),
                         "^" => N(a.powf(b)),
                         "<" => B(a < b),
                         "<=" => B(a <= b),
@@ -393,6 +426,14 @@ impl Node {
 mod tests {
     use super::*;
     #[test]
+    fn modulo_preserves_fused_and_unfused_rounding() {
+        for (fused, expected) in [(false, 0.0_f64), (true, 70368744177664.0_f64)] {
+            let node = Node::Modulo(Box::new(Node::Input(0)), Box::new(Node::Input(1)), fused);
+            let actual = node.evaluate(&[1e30, 3.0]).unwrap().number().unwrap();
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+    }
+    #[test]
     fn numeric_edge_cases_match_vm_results_and_errors() {
         let lua = mlua::Lua::new();
         for source in [
@@ -416,7 +457,10 @@ mod tests {
             let plan = NumericExpression::compile(source, &["x", "y"]).unwrap();
             for (x, y) in [
                 (0.0, 0.0),
+                (0.0, 2.0),
+                (0.0, -2.0),
                 (-0.0, 2.0),
+                (-0.0, -2.0),
                 (-7.0, 3.0),
                 (7.0, -3.0),
                 (f64::INFINITY, 2.0),
@@ -424,6 +468,9 @@ mod tests {
                 (f64::NAN, 2.0),
                 (2.0, f64::NAN),
                 (1e30, 3.0),
+                (-1e30, 3.0),
+                (1e30, -3.0),
+                (-1e30, -3.0),
             ] {
                 lua.globals().set("x", x).unwrap();
                 lua.globals().set("y", y).unwrap();
