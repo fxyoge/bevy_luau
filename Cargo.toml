@@ -11,7 +11,7 @@ serde = ["dep:serde"]
 
 [dependencies]
 full_moon = { version = "2.2.0", features = ["luau"] }
-mlua = { version = "0.11", features = ["luau", "vendored"] }
+mlua = { version = "0.12", features = ["luau", "vendored"] }
 serde = { version = "1", features = ["derive", "rc"], optional = true }
 
 [dev-dependencies]
